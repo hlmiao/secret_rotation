@@ -20,32 +20,48 @@
 ### 整体架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Secrets Manager                          │
-│  ┌──────────────────┐  ┌──────────────────┐                │
-│  │ Secret-MySQL-1   │  │ Secret-MySQL-2   │  ... (50个)    │
-│  │ (30天轮换)       │  │ (30天轮换)       │                │
-│  └────────┬─────────┘  └────────┬─────────┘                │
-└───────────┼────────────────────┼──────────────────────────┘
-            │                    │
-            └────────┬───────────┘
-                     ↓
-         ┌───────────────────────┐
-         │  MySQL Rotation       │
-         │  Lambda Function      │
-         └───────────┬───────────┘
-                     ↓
-         ┌───────────────────────┐
-         │   RDS API (VPC        │
-         │   Endpoint)           │
-         └───────────┬───────────┘
-                     ↓
-    ┌────────────────────────────────────┐
-    │  RDS MySQL Instances (50个)        │
-    │  - mysql-rds-1                     │
-    │  - mysql-rds-2                     │
-    │  - ...                             │
-    └────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          AWS Secrets Manager                                │
+│                                                                             │
+│  MySQL Secrets          PostgreSQL Secrets        Oracle Secrets           │
+│  ┌──────────────┐       ┌──────────────┐         ┌──────────────┐         │
+│  │Secret-MySQL-1│       │Secret-PG-1   │         │Secret-Oracle-1│        │
+│  │(30天轮换)     │       │(30天轮换)     │         │(30天轮换)     │        │
+│  └──────┬───────┘       └──────┬───────┘         └──────┬────────┘        │
+│  ┌──────────────┐       ┌──────────────┐         ┌──────────────┐         │
+│  │Secret-MySQL-2│       │Secret-PG-2   │         │Secret-Oracle-2│        │
+│  └──────┬───────┘       └──────┬───────┘         └──────┬────────┘        │
+│    ... (50个)              ... (30个)               ... (20个)            │
+└─────────┼──────────────────────┼──────────────────────────┼───────────────┘
+          │                      │                          │
+          ↓                      ↓                          ↓
+   ┌─────────────┐        ┌─────────────┐          ┌─────────────┐
+   │   MySQL     │        │ PostgreSQL  │          │   Oracle    │
+   │  Rotation   │        │  Rotation   │          │  Rotation   │
+   │   Lambda    │        │   Lambda    │          │   Lambda    │
+   └──────┬──────┘        └──────┬──────┘          └──────┬──────┘
+          │                      │                          │
+          └──────────────────────┼──────────────────────────┘
+                                 ↓
+                    ┌────────────────────────┐
+                    │   RDS API              │
+                    │   (VPC Endpoint)       │
+                    │   ModifyDBInstance     │
+                    │   DescribeDBInstances  │
+                    └────────────┬───────────┘
+                                 ↓
+        ┌────────────────────────┼────────────────────────┐
+        │                        │                        │
+        ↓                        ↓                        ↓
+┌───────────────┐        ┌───────────────┐       ┌───────────────┐
+│ RDS MySQL     │        │ RDS PostgreSQL│       │ RDS Oracle    │
+│ Instances     │        │ Instances     │       │ Instances     │
+│ (50个)        │        │ (30个)        │       │ (20个)        │
+│               │        │               │       │               │
+│ - mysql-rds-1 │        │ - pg-rds-1    │       │ - oracle-rds-1│
+│ - mysql-rds-2 │        │ - pg-rds-2    │       │ - oracle-rds-2│
+│ - ...         │        │ - ...         │       │ - ...         │
+└───────────────┘        └───────────────┘       └───────────────┘
 ```
 
 ### 关键设计决策
@@ -54,8 +70,24 @@
 |--------|------|------|
 | **密码修改方式** | RDS API | 无需数据库连接，简化实现，统一接口 |
 | **Lambda组织方式** | 每种数据库引擎一个Lambda | 独立维护，故障隔离，支持引擎特定优化 |
-| **Secret颗粒度** | 1个RDS = 1个Secret | 独立轮换，互不影响，精细化管理 |
+| **Secret颗粒度** | 1种RDS = 1个Secret | 独立轮换，互不影响，精细化管理 |
 | **网络架构** | VPC Endpoint | 降低NAT网关成本，提高安全性 |
+
+| 特性对比 | 方法1: RDS API方式 | 方法2: pymysql直连方式|
+|---------|------------------|---------------------|
+| 修改密码方式 | 调用AWS RDS API | 直接连接数据库执行SQL |
+| 核心代码 | rds_client.modify_db_instance() | pymysql.connect() + ALTER USER |
+| 修改的密码 | RDS Master User密码 | 任意数据库用户密码 |
+| 网络连接 | 访问AWS服务API（公网） | 访问RDS数据库（VPC内网） |
+| Lambda位置 | 可在VPC内或VPC外 | 必须在VPC内 |
+| VPC Endpoint需求 | 需要RDS API endpoint<br> 需要Secrets Manager endpoint | 只需要Secrets Manager endpoint |
+| NAT Gateway需求 | 如果不用endpoint，需要NAT | 如果不用endpoint，需要NAT |
+| 外部依赖 | 无（boto3内置） | 需要pymysql Layer |
+| 安全组配置 | Lambda出站：HTTPS(443) | Lambda出站：MySQL(3306) |
+| RDS状态等待 | 需要等待RDS变为available | 立即生效，无需等待 |
+| 执行时间 | 较长（需等待RDS修改完成） | 较快（直接执行SQL） |
+| 适用场景 | 修改RDS主用户密码 | 修改应用数据库用户密码 |
+| 多用户支持 | 只能修改Master User | 可以修改任意用户 |
 
 ## 组件说明
 
@@ -357,16 +389,16 @@ Lambda函数输出详细日志：
 ## 配置截图
 
 ### Secrets Manager配置
-![Secrets Manager配置](./screenshots/secrets-manager-config.png)
+![Secrets Manager配置](./pic/secret_value.png)
 
 ### Lambda函数配置
-![Lambda函数配置](./screenshots/lambda-config.png)
+![Lambda函数配置](./pic/lambda_execute_role.png)
 
 ### VPC Endpoint配置
-![VPC Endpoint配置](./screenshots/vpc-endpoint-config.png)
+![VPC Endpoint配置](./pic/endpoints.png)
 
 ### CloudWatch监控
-![CloudWatch监控](./screenshots/cloudwatch-monitoring.png)
+![CloudWatch监控](./pic/log_stream.png)
 
 ## 待办事项
 
