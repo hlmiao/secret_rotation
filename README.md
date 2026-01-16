@@ -15,7 +15,7 @@
 - 完整的错误处理和CloudWatch监控
 - 使用VPC Endpoint降低成本
 
-## 🏗️ 架构设计
+## 架构设计
 
 ### 整体架构
 
@@ -276,7 +276,7 @@ aws cloudwatch put-metric-alarm \
   --alarm-actions arn:aws-cn:sns:region:account:alert-topic
 ```
 
-## 🔄 密码轮换流程
+## 密码轮换流程
 
 Lambda函数实现标准的四步轮换流程：
 
